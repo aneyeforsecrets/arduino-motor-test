@@ -16,17 +16,57 @@ enum Motor
   MOTOR_B,
 };
 
-const int kCurrentSensingThreshhold = 1000;
+const uint8_t PWM_MAX = 255;
+const uint8_t PWM_HALF = PWM_MAX / 2;
 
-/*  VNH2SP30 pin definitions
- xxx[0] controls '1' outputs
- xxx[1] controls '2' outputs */
-const int kInAPin[2] = {2, 0}; // INA: Clockwise input
-const int kInBPin[2] = {3, 0}; // INB: Counter-clockwise input
-const int kPwmPin[2] = {5, 0}; // PWM input
-const int kCspPin[2] = {0, 0}; // CS: Current sense ANALOG input
-const int kEnPin[2] = {1, 0};  // EN: Status of switches output (Analog pin)
+const int kCurrentSensingThreshhold = 5000;
 
+/* Voltage controlled input pins with hysteresis, CMOS compatible. These two pins
+control the state of the bridge in normal operation according to the truth table (brake
+to VCC , brake to GND, clockwise and counterclockwise).
+
+Table 1.    Truth table in normal operating conditions
++------+-----+------+-----+-------+-------+---------------------+------------------------+
+| INA  | INB | ENA  | ENB | OUTA  | OUTB  |         CS          |          MODE          |
++------+-----+------+-----+-------+-------+---------------------+------------------------+
+|    1 |   1 |    1 |   1 | H     | H     | High Imp.           | Brake to VCC           |
+|    1 |   0 |    1 |   1 | H     | L     | I_Sense = I_OUT / K | Clockwise (CW)         |
+|    0 |   1 |    1 |   1 | L     | H     | I_SENSE = I_OUT / K | Counterclockwise (CCW) |
+|    0 |   0 |    1 |   1 | L     | L     | High Imp.           | Brake to GND           |
++------+-----+------+-----+-------+-------+---------------------+------------------------+
+For more information, see the VNH2SP30-E motor driver datasheet */
+const int kInAPin[2] = {2, 0};
+const int kInBPin[2] = {3, 0};
+
+/* Voltage controlled input pins with hysteresis, CMOS compatible. Gates of low side
+FETs are modulated by the PWM signal during their ON phase allowing speed
+control of the motors. */
+const int kPwmPin[2] = {5, 0};
+
+/* When pulled low, disables the half-bridge of the VNH2SP30-E of the motor. In case of 
+fault detection (thermal shutdown of a high side FET or excessive ON state voltage drop 
+across a low side FET), this pin is pulled low by the device. 
+
+Table 2.    Truth table in fault conditions (detected on OUTA)
++------+-----+------+-----+-------+-------+------------+
+| INA  | INB | ENA  | ENB | OUTA  | OUTB  |     CS     |
++------+-----+------+-----+-------+-------+------------+
+| 1    | 1   |    1 |   1 | OPEN  | H     | High Imp.  |
+| 1    | 0   |    1 |   1 | OPEN  | L     | High Imp.  |
+| 0    | 1   |    1 |   1 | OPEN  | H     | I_OUTB / K |
+| 0    | 0   |    1 |   1 | OPEN  | L     | High Imp.  |
+| X    | X   |    0 |   0 | OPEN  | OPEN  | High Imp.  |
+| X    | 1   |    0 |   1 | OPEN  | H     | I_OUTB / K |
+| X    | 0   |    0 |   1 | OPEN  | L     | High Imp.  |
++------+-----+------+-----+-------+-------+------------+
+For more information, see the VNH2SP30-E motor driver datasheet */
+const int kEnPin[2] = {1, 0};
+
+/* Analog current sense input. This input senses a current proportional to the motor
+current. The information can be read back as an analog voltage. */
+const int kCspPin[2] = {0, 0};
+
+// On-Board LED used as status indication
 const int kStatPin = 13;
 
 // LCD
@@ -40,7 +80,7 @@ const uint8_t kYPin = 6;
 void lcdSetup(int address)
 {
   Wire.beginTransmission(kLcdAddress);
-  lcd.clear();
+  lcd.begin(16, 2);
   lcd.setBacklight(255);
 }
 
@@ -77,16 +117,16 @@ void motorOff(int motor)
  the motor will continue going in that direction, at that speed
  until told to do otherwise.
  
- motor: this should be either 0 or 1, will selet which of the two
- motors to be controlled
+ motor: this should be either MOTOR_A (0) or MOTOR_B (1), will select 
+ which of the two motors to be controlled. Invalid values are ignored.
  
  mode: Should be one of the following values
-  BRAKEVCC: Brake to VCC
-  CW: Turn Clockwise
-  CCW: Turn Counter-Clockwise
-  BRAKEGND: Brake to GND
+  BRAKEVCC (0): Brake to VCC
+  CW (1): Turn Clockwise
+  CCW (2): Turn Counter-Clockwise
+  BRAKEGND (3): Brake to GND
  
- speed: should be a value between 0 and 255, higher the number, the faster
+ speed: should be a value between 0 and PWM_MAX (255), higher the number, the faster
  */
 void motorGo(Motor motor, MotorMode mode, uint8_t speed)
 {
@@ -95,25 +135,25 @@ void motorGo(Motor motor, MotorMode mode, uint8_t speed)
   {
     switch (mode)
     {
-    case BRAKEVCC:
+    case BRAKEVCC: // Brake to VCC
       digitalWrite(kInAPin[motor], HIGH);
       digitalWrite(kInBPin[motor], HIGH);
       break;
-    case CW:
+    case CW: // Turn Clockwise
       digitalWrite(kInAPin[motor], HIGH);
       digitalWrite(kInBPin[motor], LOW);
       break;
-    case CCW:
+    case CCW: // Turn Counter-Clockwise
       digitalWrite(kInAPin[motor], LOW);
       digitalWrite(kInBPin[motor], HIGH);
       break;
-    case BRAKEGND:
+    case BRAKEGND: // Brake to GND
       digitalWrite(kInAPin[motor], LOW);
       digitalWrite(kInBPin[motor], LOW);
       break;
 
     default:
-      // Invalid mode skips changing the PWM signal
+      // Invalid mode does not change the PWM signal
       return;
     }
     analogWrite(kPwmPin[motor], speed);
@@ -134,9 +174,17 @@ void setup()
 
 void loop()
 {
-  int joyX;
-  int joyY;
-  int deadZoneX = abs(analogRead(kXPin) - 512) + 5;
+  uint16_t joyX;
+  uint16_t joyY;
+  const uint16_t deadZoneX = 5;
+  const uint16_t deadZoneY = 5;
+  const uint16_t minX = 0;
+  const uint16_t minY = 0;
+  const uint16_t maxX = 1023;
+  const uint16_t maxY = 1023;
+  const int calibrateX = -(analogRead(kXPin) - 511);
+  const int calibrateY = -(analogRead(kYPin) - 511);
+
   uint8_t speed;
   MotorMode mode;
   int time = 0;
@@ -153,12 +201,13 @@ void loop()
     joyX = analogRead(kXPin);
     joyY = analogRead(kYPin);
 
-    speed = abs(joyX - 512) / 2;
-    if (joyX - 512 < -deadZoneX)
+    speed = constrain(map(abs(joyX + calibrateX - 511), minX, (maxX + calibrateX) - 511, 0, 255), 0, 255);
+
+    if (joyX + calibrateX - 511 < -deadZoneX)
     {
       mode = CCW;
     }
-    else if (joyX - 512 > deadZoneX)
+    else if (joyX + calibrateX - 511 > deadZoneX)
     {
       mode = CW;
     }
@@ -167,15 +216,14 @@ void loop()
       mode = BRAKEVCC;
       speed = 0;
     }
-    
-    if (time % 100 == 0)
+
+    if (time % 200 == 0)
     {
       line0 = String("");
       line1 = String("");
 
       line0 = String(line0 + "Speed: " + String(speed, DEC));
-      line1 = String(line1 + "Mode: " + String(mode, DEC));
-
+      line1 = String(line1 + "JoyX: " + String(joyX, DEC));
       lcd.clear();
       lcd.print(line0);
       // Serial.println(speed);
@@ -186,13 +234,17 @@ void loop()
 
     motorGo(MOTOR_A, mode, speed);
 
-    // if (analogRead(kCspPin[MOTOR_A]) > kCurrentSensingThreshhold)
-    // { // If the motor locks, it will shutdown and Resets the process of increasing the PWM
-    //   state = -1;
-    //   continue;
-    // }
-    time++;
-    delay(1);
+    if ((analogRead(kCspPin[0]) < kCurrentSensingThreshhold) && (analogRead(kCspPin[1]) < kCurrentSensingThreshhold))
+    {
+      digitalWrite(kStatPin, HIGH);
+    }
+    else
+    {
+      digitalWrite(kStatPin, LOW);
+      break;
+    }
+    time = time + 10;
+    delay(10);
   }
   motorOff(MOTOR_A);
 }
